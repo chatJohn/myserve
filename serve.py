@@ -2,7 +2,8 @@
 tinyserve: a small vLLM-style inference engine in one file.
 
 This is a simpler implementation of Paged KV Cache with prefix caching, 
-continuous batching with chunked prefill, FlashAttention (or a pure torch reference), 
+continuous batching with chunked prefill, n-gram speculative decoding,
+FlashAttention (or a pure torch reference),
 CUDA graphs for decoding and an OpenAI-compatible HTTP Server
 
 Current support for Llama class models like Llama3, Qwen2/3 and Qwen3MoE
@@ -92,9 +93,13 @@ class Config:
     tensor_parallel_size: int = 1 # split dense layers like Megatron
     expert_parallel: bool = False # MoE under tp > 1: whole experts per GPU instead of slicing every expert
     p2p_all_reduce: bool = True # tp > 1: our all-reduce over NVLink/P2P (tinycomm.py) instead of NCCL
+    num_speculative_tokens: int = 0 # max n-gram draft tokens per decode request, 0 disables
 
 
     def __post_init__(self):
+        if self.num_speculative_tokens < 0:
+            raise ValueError("--num-speculative-tokens must be nonnegative")
+
         # if flash_attn not available dont use
         if self.attention_backend == "flash_attn" and not FLASH_ATTN_AVAILABLE:
             warnings.warn("flash attention not available, default to torch")
@@ -438,25 +443,54 @@ class KVCacheManager:
                 # for some reason, there is no need to overwrite it
                 self.hash_to_block.setdefault(h, b)
 
-    def free_request(self, req: Request):
-        # clear out everything at the end of a request
-        # resetting the state back and returning the blocks
-        # back for use by other requests
-        for b in reversed(req.block_ids):
+    def _release_tail(self, req: Request, keep_blocks: int):
+        for b in reversed(req.block_ids[keep_blocks:]):
             self.ref_cnt[b] -= 1
             if self.ref_cnt[b] == 0:
                 self.free[b] = None
-        req.block_ids = []
+        del req.block_ids[keep_blocks:]
+
+    def free_request(self, req: Request):
+        self._release_tail(req, 0)
+
+    def commit_speculation(self, req: Request, accepted: int):
+        # Draft slots past the committed prefix are outside the next attention
+        # span. Release whole unused pages and only cache verified full blocks.
+        req.num_computed_tokens += accepted
+        self._release_tail(req, -(-req.num_computed_tokens // self.block_size))
+        self._register_full_blocks(req, req.num_computed_tokens)
 
 @dataclass
 class ScheduledRequest:
     req: Request        # the live request
     num_computed: int   # KV present before this foward pass
-    num_new: int        # how many tokens this forward will process
+    num_new: int        # how many tokens this forward will process, including its draft
+    draft: tuple[int, ...] = ()
 
     @property
     def completes_prompt(self):
         return self.num_computed + self.num_new >= self.req.num_tokens
+
+def lookup_ngram_draft(req: Request, limit: int) -> tuple[int, ...]:
+    """Copy the continuation of a matching 2–4 token suffix from this request."""
+    end = req.num_tokens - req.pending
+    # Skip the first predicted token when an async sample is still pending.
+    # The runner will use the real sample as input when it verifies the draft.
+    history = req.token_ids[:end]
+    reverse = history[::-1]
+    for size in range(min(4, end - 1), 1, -1):
+        suffix = reverse[:size]
+        offset = req.pending + 1
+        while True:
+            try:
+                offset = reverse.index(suffix[0], offset)
+            except ValueError:
+                break
+            if reverse[offset:offset + size] == suffix:
+                start = end - offset + req.pending
+                return tuple(history[start:start + limit])
+            offset += 1
+    return ()
 
 class Scheduler:
 
@@ -601,7 +635,32 @@ class Scheduler:
             plan[req.request_id] = n
             budget -= n
 
-        # 3. emit the batch in running order
+        # 3. Reserve draft tokens using only the budget and pages left after
+        # ordinary scheduling. A draft never triggers preemption or delays admission.
+        drafts: dict[str, tuple[int, ...]] = {}
+        if self.cfg.num_speculative_tokens and budget:
+            for req in self.running:
+                n = plan.get(req.request_id)
+                if (n != 1 or req.num_computed_tokens < req.prompt_len
+                        or req.num_computed_tokens + n != req.num_tokens
+                        or req.params.forced_token_ids is not None):
+                    continue
+
+                # Verification can emit a correction or a bonus token after the draft.
+                room = min(self.cfg.max_model_len - req.num_tokens,
+                           req.params.max_tokens - (req.num_tokens - req.prompt_len))
+                kv_room = (len(req.block_ids) + self.kv.num_free) * self.kv.block_size - req.num_tokens
+                limit = min(self.cfg.num_speculative_tokens, budget, room - 1, kv_room)
+                if limit <= 0:
+                    continue
+                draft = lookup_ngram_draft(req, limit)
+                if draft and self.kv.allocate(req, n + len(draft)):
+                    drafts[req.request_id] = draft
+                    budget -= len(draft)
+                    if budget == 0:
+                        break
+
+        # 4. emit the batch in running order
         batch = []
         for req in self.running:
             # for every running request create a ScheduledRequest
@@ -609,10 +668,13 @@ class Scheduler:
                 # Capture num_computed_tokens before advancing it: the runner
                 # needs the old value for positions and slots, and
                 # completes_prompt compares it against num_tokens.
-                batch.append(ScheduledRequest(req, req.num_computed_tokens, plan[req.request_id]))
+                n = plan[req.request_id]
+                draft = drafts.get(req.request_id, ())
+                batch.append(ScheduledRequest(req, req.num_computed_tokens, n + len(draft), draft))
 
                 # Advanced optimistically, before the model has run.
-                req.num_computed_tokens += plan[req.request_id]
+                # Draft KV becomes visible only once verification accepts it.
+                req.num_computed_tokens += n
 
         return batch
 
@@ -1501,14 +1563,12 @@ def apply_repetition_penalty(logits, params: list[SamplingParams], token_ids: li
 def sample(logits, params: list[SamplingParams], token_ids: list[list[int]] | None = None):
     """One batched call for mixed sampling settings.
 
-    logits:    [B, V]  next-token logits, one row per request that produced
-                       a real sample this step (completes_prompt).
+    logits:    [B, V]  next-token logits, one row per sequence position to sample.
     params:    length B, per-request temperature / top_k / top_p / repetition penalty.
     token_ids: length B, each request's context so far (for the repetition penalty)
 
-    Returns the sampled token ids as a [B] GPU tensor, NOT a Python list: turning
-    them into a list would make the CPU wait for the GPU. Engine.step keeps them on
-    the GPU for the next step's inputs and copies them back in the background
+    Returns the sampled token ids as a [B] GPU tensor. Ordinary decode keeps
+    them on the GPU for the next step and copies them back in the background.
     """
     # the penalty goes first (llama.cpp's order), so it also steers greedy decoding.
     # It edits logits in place, so copy them first if a request wants the raw logprobs
@@ -1746,8 +1806,10 @@ class ModelRunner:
         n = self.cfg.max_num_batched_tokens
         h = self.model(self.input_ids[:n], self.positions[:n])
 
-        # Logits path sized for a full decode batch (one row per seq slot).
-        self.model.logits(h[: self.cfg.max_num_seqs]).float().softmax(-1)   # worst case: fp32 copies of all logits
+        # A verification batch can project the ordinary row and every draft
+        # row for each request, up to the total token budget.
+        logit_rows = min(n, self.cfg.max_num_seqs * (1 + self.cfg.num_speculative_tokens))
+        self.model.logits(h[:logit_rows]).float().softmax(-1)
 
         # drop the tensor, peak already recorded
         del h
@@ -1856,13 +1918,15 @@ class ModelRunner:
             blocks = np.asarray(s.req.block_ids)          # what are these requests block_ids
 
             # pack together each batch into a single stream
-            ids.extend(s.req.token_ids[start:start + n])  # packed input ids
-            if s.req.pending and start + n == s.req.num_tokens:
+            base_end = start + n - len(s.draft)
+            ids.extend(s.req.token_ids[start:base_end])
+            if s.req.pending and base_end == s.req.num_tokens:
                 # the newest token is a placeholder (its value is still on the GPU,
                 # sampled last step): put a 0 here, _upload copies the real id in
                 ids[-1] = 0
                 fill_rows.append(len(ids) - 1)
                 fill_src.append(s.req.pending_row)
+            ids.extend(s.draft)
             # position embeds restart from 0 for every sample
             pos.extend(p.tolist())                        # RoPE / causal positions
 
@@ -1872,7 +1936,9 @@ class ModelRunner:
             qsl.append(qsl[-1] + n)                       # request i owns q[qsl[i]:qsl[i+1]]
             seq_lens.append(start + n)                    # kv_len after this step's write
             bt[i, : len(blocks)] = blocks                 # page-table row
-            logit_rows.append(qsl[-1] - 1)                # last packed row -> sample logits here
+            # The last ordinary input predicts the first draft token. Each
+            # draft input predicts the following token, including the bonus.
+            logit_rows.extend(range(qsl[-1] - 1 - len(s.draft), qsl[-1]))
 
         # Dummy decode request so T and B match the captured graph, slot 0 writes
         # to the null page, outputs are never sampled when doing graph capture, we dont
@@ -2072,7 +2138,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward_logits(self, packed: PackedBatch, mode: str, size: int | None):
-        """The forward pass, then the logits of each real request's last query (every rank)"""
+        """The forward pass, then the selected next-token logits (every rank)."""
         hidden = self.forward_step(packed, mode, size)
         return self.model.logits(hidden[to_gpu(packed.logit_rows, torch.int64)]) 
     
@@ -2474,8 +2540,9 @@ class Engine:
     def abort(self, request_id: str) -> None:
         """Client went away: stop the request and give its KV blocks back."""
         req = self.requests.pop(request_id, None)
-        if req is not None and not req.finished:
-            self.scheduler.finish(req, "abort")
+        if req is not None:
+            if not req.finished:
+                self.scheduler.finish(req, "abort")
             self.detok.pop(request_id, None)
 
     def has_work(self):
@@ -2510,7 +2577,9 @@ class Engine:
         """
         The CPU stays one step ahead by preparing the next batch before the current
         batch has even finished sampleing. This works because our scheduling needs
-        to know how many tokens each request will process NOT their actual token ids
+        to know how many tokens each request will process NOT their actual token ids.
+        A speculative batch resolves its variable output counts at step 3 before
+        scheduling the next batch.
 
             1. GPU: Run the forward pass for step i, using the batch prepped in the
                     previous step i-1
@@ -2549,11 +2618,14 @@ class Engine:
         #    real IDs for repetition-penalty sampling. Requests that finish in step 2 may
         #    have already run this forward pass and their sampled rows will be discarded
         if batch:
-            done = self.runner.launch_sample(batch, logits)
-
-            # Count prompt tokens processed in this batch for statistics.
             self.num_prompt_tokens_run += sum(s.num_new for s in batch if s.num_computed < s.req.prompt_len)
 
+        if batch and any(s.draft for s in batch):
+            # The next schedule needs the exact accepted length before it can
+            # use or reclaim these pages. Single-token batches still overlap.
+            outputs.extend(self._finish_speculative_step(batch, logits))
+        elif batch:
+            done = self.runner.launch_sample(batch, logits)
             live = []
             for i, s in enumerate(batch):
                 req = s.req
@@ -2590,7 +2662,8 @@ class Engine:
             self.in_flight = (batch, live, logits, done)
             self.num_generated_tokens += len(live)
 
-        # 4. schedule + pack the next step while the GPU is still busy
+        # 4. Schedule and pack the next step. For ordinary batches this overlaps
+        # the GPU's sampling and token copy.
         nxt = self.scheduler.schedule()
 
         # tokens that step spends out of max_num_batched_tokens -
@@ -2659,46 +2732,102 @@ class Engine:
             if req.params.return_logprobs:
                 req.logprobs.append(logits[i].float().log_softmax(-1).cpu())
 
-            # Handle EOS or other stop-tokens. A request may already be marked
-            # finished due to its length limit in step 3, if its final token is EOS
-            # report "stop", otherwise finish it now which releases KV pages
-            if tok in self.stop_ids and not req.params.ignore_eos:
-                if req.finished:
-                    req.finish_reason = "stop"
-                else:
-                    self.scheduler.finish(req, "stop")
-
-            # incremental detokenization
-            d = self.detok[req.request_id]
-            delta = d.update(req.output_ids, req.finished)
-            text = d.text
-
-            # stop strings: finish the moment one appears (freeing its KV pages
-            # right away), and only ever release text that can't be part of one
-            if req.params.stop:
-                text, hit = apply_stop_strings(d.text, req.params.stop)
-                if hit and not req.finished:
-                    self.scheduler.finish(req, "stop")
-                elif req.finished and not hit:
-                    text = d.text  # ended some other way: flush the held-back tail
-                delta, d.released = text[d.released:], len(text)
-
-            # Store the output
-            outputs.append(Output(
-                req.request_id, text, delta, req.output_ids, req.finished,
-                req.finish_reason, req.prompt_len, req.num_cached_tokens,
-                req.logprobs if req.params.return_logprobs else None,
-                req.was_preempted, req.was_chunked_prefill,
-            ))
-
-            # If done clear it out
-            if req.finished:
-                self.total_prompt_tokens += req.prompt_len
-                self.total_cached_tokens += req.num_cached_tokens
-                del self.detok[req.request_id]
-                del self.requests[req.request_id]
+            text, delta, reason = self._update_output(req, tok)
+            outputs.append(self._emit_output(req, text, delta, reason))
 
         return outputs
+
+    @torch.inference_mode()
+    def _finish_speculative_step(self, batch: list[ScheduledRequest], logits: torch.Tensor):
+        rows, params, contexts, live = [], [], [], []
+        row = 0
+        for s in batch:
+            req = s.req
+            count = 1 + len(s.draft)
+            if not s.completes_prompt:
+                req.was_chunked_prefill = True
+            elif not req.finished:
+                live.append((s, len(rows)))
+                history = req.token_ids
+                if req.params.repeat_last_n > 0:
+                    history = history[-req.params.repeat_last_n:]
+                for j in range(count):
+                    rows.append(row + j)
+                    params.append(req.params)
+                    # Position j is conditioned on the draft through j-1.
+                    contexts.append(history + list(s.draft[:j]) if j else history)
+            row += count
+
+        if not live:
+            return []
+        if len(rows) != row:
+            logits = logits[to_gpu(rows, torch.int64)]
+        tokens = sample(logits, params, contexts).tolist()
+
+        outputs = []
+        for s, start in live:
+            req = s.req
+            deltas = []
+            for j in range(1 + len(s.draft)):
+                forced = req.params.forced_token_ids
+                tok = tokens[start + j] if forced is None else forced[req.num_tokens - req.prompt_len]
+                req.token_ids.append(tok)
+                if req.params.return_logprobs:
+                    req.logprobs.append(logits[start + j].float().log_softmax(-1).cpu())
+                text, delta, reason = self._update_output(req, tok)
+                deltas.append(delta)
+                # A deterministic draft can be accepted by comparing with a
+                # target sample. The first mismatch supplies the correction.
+                if reason or j == len(s.draft) or tok != s.draft[j]:
+                    break
+
+            if s.draft:
+                # Every emitted token except the last has verified KV. Use the
+                # last emitted token as the next decode input as usual.
+                self.kv.commit_speculation(req, j)
+            self.num_generated_tokens += j + 1
+            outputs.append(self._emit_output(req, text, "".join(deltas), reason))
+
+        return outputs
+
+    def _update_output(self, req: Request, tok: int):
+        reason = req.finish_reason
+        if tok in self.stop_ids and not req.params.ignore_eos:
+            reason = "stop"
+        elif req.num_tokens - req.prompt_len >= req.params.max_tokens or req.num_tokens >= self.cfg.max_model_len:
+            reason = "length"
+
+        d = self.detok[req.request_id]
+        delta = d.update(req.output_ids, reason is not None)
+        text = d.text
+        if req.params.stop:
+            text, hit = apply_stop_strings(d.text, req.params.stop)
+            if hit:
+                reason = reason or "stop"
+            elif reason:
+                text = d.text  # flush the held-back suffix on EOS or length
+            delta, d.released = text[d.released:], len(text)
+        return text, delta, reason
+
+    def _emit_output(self, req: Request, text: str, delta: str, reason: str | None) -> Output:
+        if reason:
+            if req.finished:
+                req.finish_reason = reason
+            else:
+                self.scheduler.finish(req, reason)
+
+        output = Output(
+            req.request_id, text, delta, req.output_ids, req.finished,
+            req.finish_reason, req.prompt_len, req.num_cached_tokens,
+            req.logprobs if req.params.return_logprobs else None,
+            req.was_preempted, req.was_chunked_prefill,
+        )
+        if req.finished:
+            self.total_prompt_tokens += req.prompt_len
+            self.total_cached_tokens += req.num_cached_tokens
+            del self.detok[req.request_id]
+            del self.requests[req.request_id]
+        return output
 
     def generate(self, prompts: list, params: SamplingParams | list[SamplingParams]):
         """Offline batch API, add everything, step until done."""
@@ -3116,6 +3245,8 @@ def main():
     ap.add_argument("--max-model-len", type=int, default=8192)
     ap.add_argument("--max-num-seqs", type=int, default=256)
     ap.add_argument("--max-num-batched-tokens", type=int, default=2048)
+    ap.add_argument("--num-speculative-tokens", type=int, default=0,
+                    help="max n-gram draft tokens per decode request (0 = off)")
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     ap.add_argument("--no-cuda-graphs", action="store_true")
     ap.add_argument("--no-prefix-caching", action="store_true")
@@ -3134,6 +3265,7 @@ def main():
                  max_model_len=a.max_model_len, 
                  max_num_seqs=a.max_num_seqs,
                  max_num_batched_tokens=a.max_num_batched_tokens,
+                 num_speculative_tokens=a.num_speculative_tokens,
                  gpu_memory_utilization=a.gpu_memory_utilization,
                  use_cuda_graphs=not a.no_cuda_graphs,
                  enable_prefix_caching=not a.no_prefix_caching,

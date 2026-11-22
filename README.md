@@ -6,6 +6,7 @@ It is meant to be read. `serve.py` is written as a plain PyTorch reference with 
 
 - **Paged KV Cache** with **Prefix Caching**: Shared prompt prefixes reuse cache blocks instead of recomputing them. 
 - **Continuous Batching** with **chunked prefill**, request **preemption** and **async scheduling** (the cpu schedules step n+1 while the GPU runs step n)
+- **N-gram speculative decoding** with target-model verification in the same batch
 - **Triton Kernels Everywhere** (`tinykernels.py`): Paged Attention w/ Split-KV Decoding, fused RMSNorm, q-k-norm + RoPE, SwiGLU, Fused Mixture-of-Experts, and a Fused Sampler. 
 - **Full CUDA-Graphs** for decode steps and mixed-prefill
 - **Tensor Parallelism** (`-tp`) and **expert parallelism** (`--expert-parallel`) across GPUs
@@ -39,6 +40,7 @@ Every command is `python serve.py <serve|generate> [flags]`:
 --max-model-len 8192              max prompt + output tokens per request
 --max-num-seqs 256                max requests in one batch
 --max-num-batched-tokens 2048     token budget per step
+--num-speculative-tokens 4       up to 4 n-gram draft tokens per decode request (default 0)
 --gpu-memory-utilization 0.85     fraction of the card the engine may use
 --log-stats-interval 10           verbosity frequency
 ```
@@ -60,6 +62,16 @@ python serve.py serve --model Qwen/Qwen3-30B-A3B -tp 2 --expert-parallel
 python serve.py generate --prompt "The meaning of life is" --max-tokens 64
 ```
 `--temperature`, `--repetition-penalty` and `--repeat-last-n` can be applied here as well
+
+## Speculative Decoding
+
+```bash
+python serve.py serve --model Qwen/Qwen3-8B --num-speculative-tokens 4
+```
+
+The scheduler looks for a matching 2–4 token suffix in each request's prompt and generated history. It adds the continuation to the regular batch when token budget and KV pages are available. The target model samples each candidate position with the request's sampling settings. Verification emits the matching prefix and a correction at the first mismatch, or a bonus token when the entire draft matches. This uses the same model and tokenizer as ordinary decoding.
+
+Verification batches commit their results before scheduling the next batch. Ordinary batches still use async scheduling. The CLI flag also works with `generate`.
 
 ## Python Usage
 ```python
